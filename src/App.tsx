@@ -25,6 +25,14 @@ interface Persisted {
   customQuestions: Question[]
 }
 
+interface UploadedQuestion {
+  question: string
+  subject?: string
+  answerOptions: { id: string; text: string }[]
+  correctAnswer: string | number
+  explanation?: string
+}
+
 const todayKey = () => new Date().toISOString().slice(0, 10)
 const shuffle = <T,>(items: T[]) => {
   const copy = [...items]
@@ -41,6 +49,100 @@ function loadState(): Persisted {
     const raw = localStorage.getItem('hpc-final-state')
     return raw ? { ...defaultPersisted, ...JSON.parse(raw) } : defaultPersisted
   } catch { return defaultPersisted }
+}
+
+function parseUploadedQuestions(source: string, defaultSubject: Subject): Question[] {
+  let drafts: UploadedQuestion[]
+  if (source.trim().startsWith('[') || source.trim().startsWith('{')) {
+    const parsed: unknown = JSON.parse(source)
+    const records = Array.isArray(parsed) ? parsed : [parsed]
+    drafts = records.map((value, index) => {
+      if (!value || typeof value !== 'object') throw new Error(`Entry ${index + 1} needs manual review.`)
+      const item = value as Record<string, unknown>
+      if (typeof item.question !== 'string' || !Array.isArray(item.answerOptions)) {
+        throw new Error(`Entry ${index + 1} is missing its question or answer options.`)
+      }
+      const answerOptions = item.answerOptions.map((option: unknown, optionIndex: number) => {
+        if (typeof option === 'string') return { id: ['A', 'B', 'C', 'D', 'E'][optionIndex], text: option }
+        if (option && typeof option === 'object' && 'text' in option) {
+          const record = option as { id?: unknown; text: unknown }
+          return { id: String(record.id || ['A', 'B', 'C', 'D', 'E'][optionIndex]), text: String(record.text) }
+        }
+        throw new Error(`Entry ${index + 1}, option ${optionIndex + 1} needs manual review.`)
+      })
+      if (typeof item.correctAnswer !== 'string' && typeof item.correctAnswer !== 'number') {
+        throw new Error(`Entry ${index + 1} has no verified correct answer and needs manual review.`)
+      }
+      return {
+        question: item.question,
+        subject: typeof item.subject === 'string' ? item.subject : defaultSubject,
+        answerOptions,
+        correctAnswer: item.correctAnswer,
+        explanation: typeof item.explanation === 'string' ? item.explanation : undefined,
+      }
+    })
+  } else {
+    drafts = []
+    let current: UploadedQuestion | null = null
+    for (const line of source.split(/\r?\n/)) {
+      const questionMatch = line.match(/^\s*(?:\*\*)?\d+\.\*{0,2}\s+(?:\(([^)]+)\)\s*)?(.+?)\s*$/)
+      if (questionMatch) {
+        if (current) drafts.push(current)
+        current = {
+          question: questionMatch[2].trim(),
+          subject: defaultSubject,
+          answerOptions: [],
+          correctAnswer: '',
+        }
+        continue
+      }
+      if (!current) continue
+      const optionMatch = line.match(/^\s*-\s*(✅\s*)?(?:\*\*)?([A-E])[.)]\s*(.*?)\s*(?:\*\*)?\s*$/)
+      if (optionMatch) {
+        const optionText = optionMatch[3].trim().replace(
+          /\s+(?:Memory and parallel design|OpenMP and hybrid programming|MapReduce and distributed storage|GPU and CUDA|Spark|PGAS and UPC|Basic parallel graph algorithms|MPI|HPC and Big Data\s+Practice questions)$/,
+          '',
+        ).trim()
+        current.answerOptions.push({
+          id: optionMatch[2],
+          text: optionText,
+        })
+        if (optionMatch[1]) current.correctAnswer = optionMatch[2]
+        continue
+      }
+      const answerMatch = line.match(/^\s*(?:correct answer|answer)\s*[:\-]\s*([A-E])\s*$/i)
+      if (answerMatch) current.correctAnswer = answerMatch[1].toUpperCase()
+    }
+    if (current) drafts.push(current)
+  }
+
+  if (!drafts.length) throw new Error('No questions were found. Check the file format.')
+  return drafts.map((draft, index) => {
+    const label = `Question ${index + 1}`
+    if (!draft.question.trim()) throw new Error(`${label} has no question text and needs manual review.`)
+    if (draft.answerOptions.length < 2 || draft.answerOptions.length > 5) {
+      throw new Error(`${label} has ${draft.answerOptions.length} options; it was not imported and needs manual review.`)
+    }
+    if (draft.answerOptions.some(option => !option.text.trim()) ||
+        new Set(draft.answerOptions.map(option => option.id)).size !== draft.answerOptions.length ||
+        new Set(draft.answerOptions.map(option => option.text.trim())).size !== draft.answerOptions.length) {
+      throw new Error(`${label} has an empty or duplicate option and needs manual review.`)
+    }
+    const correctAnswer = draft.correctAnswer
+    const correctId = typeof correctAnswer === 'number'
+      ? draft.answerOptions[correctAnswer]?.id
+      : draft.answerOptions.find(option => option.id === correctAnswer.toUpperCase())?.id
+    if (!correctId) throw new Error(`${label} has no matching verified correct answer and needs manual review.`)
+    return {
+      id: `custom-${crypto.randomUUID()}`,
+      sourceId: `custom-${crypto.randomUUID()}`,
+      subject: (draft.subject || defaultSubject) as Subject,
+      text: draft.question.trim(),
+      options: draft.answerOptions.map(option => ({ ...option, text: option.text.trim() })),
+      correctId,
+      explanation: draft.explanation || `The correct answer is ${correctId}: ${draft.answerOptions.find(option => option.id === correctId)?.text}.`,
+    }
+  })
 }
 
 function App() {
@@ -353,9 +455,10 @@ function App() {
       </main>
 
       {uploadOpen && <QuestionBankModal questions={allQuestions} close={() => setUploadOpen(false)} onAdd={(q) => {
-        setState(s => ({ ...s, customQuestions: [...s.customQuestions, q] }))
+        const added = Array.isArray(q) ? q : [q]
+        setState(s => ({ ...s, customQuestions: [...s.customQuestions, ...added] }))
         setUploadOpen(false)
-        showToast('Question added to your bank.')
+        showToast(`${added.length} question${added.length === 1 ? '' : 's'} added to your bank.`)
       }}/>}
     </div>
   )
@@ -494,7 +597,10 @@ function QuizView(props: {
         if (option) props.chooseAnswer(option.id)
       }
       if (event.key === 'Enter') {
-        if (props.submitted) props.nextQuestion()
+        if (isExam) {
+          if (index === total - 1) props.finishQuiz()
+          else props.nextQuestion()
+        } else if (props.submitted) props.nextQuestion()
         else props.submitAnswer()
       }
     }
@@ -528,8 +634,8 @@ function QuizView(props: {
           <div className="mt-7 space-y-3">
             {question.options.map((option, i) => {
               let classes = 'border-[#e7e9e5] bg-white hover:border-sage hover:bg-[#f7faf8]'
-              if (props.submitted || isExam) {
-                if (option.id === question.correctId && (!isExam || props.submitted)) classes = 'border-[#90b49e] bg-[#edf5ef] text-[#466452]'
+              if (props.submitted) {
+                if (option.id === question.correctId) classes = 'border-[#90b49e] bg-[#edf5ef] text-[#466452]'
                 if (props.selected === option.id && option.id !== question.correctId) classes = 'border-[#dfaaa0] bg-[#f9ece8] text-[#835b54]'
               } else if (props.selected === option.id) {
                 classes = 'border-sage bg-[#edf4ef] shadow-[0_0_0_3px_rgba(139,175,154,.12)]'
@@ -583,7 +689,6 @@ function ResultsView({ result, previous, questions, answers, startQuiz, setView,
   result: QuizResult; previous?: QuizResult; questions: Question[]; answers: (QuizAnswer | null)[]
   startQuiz: () => void; setView: (v: View) => void; mistakes: () => void
 }) {
-  const incorrect = answers.map((a,i) => ({a,q:questions[i]})).filter(x => x.a && !x.a.correct)
   const message = result.accuracy >= 90 ? 'Excellent! You’ve mastered this quest!'
     : result.accuracy >= 70 ? 'Great progress! Keep going!'
     : result.accuracy >= 50 ? 'You’re improving! Practice makes progress.'
@@ -610,16 +715,28 @@ function ResultsView({ result, previous, questions, answers, startQuiz, setView,
       </div>
       <button onClick={() => setView('dashboard')} className="mx-auto mt-5 flex items-center gap-2 text-sm font-bold text-[#668174]"><ArrowLeft size={16}/> Back to dashboard</button>
 
-      {incorrect.length > 0 && (
+      {questions.length > 0 && (
         <section className="mt-10">
-          <h2 className="text-xl font-bold">Mistakes to revisit</h2>
+          <h2 className="text-xl font-bold">Answer review</h2>
           <div className="mt-4 space-y-3">
-            {incorrect.map(({a,q}) => {
-              const correct = q.options.find(o => o.id === q.correctId)
+            {questions.map((q,index) => {
+              const answer = answers[index]
+              const selectedOption = q.options.find(o => o.id === answer?.selectedId)
+              const correctOption = q.options.find(o => o.id === q.correctId)
               return (
                 <div key={q.id} className="rounded-2xl border border-black/[0.05] bg-white p-5">
                   <p className="font-bold leading-6">{q.text}</p>
-                  <p className="mt-3 text-sm text-[#7b817e]">Correct answer: <span className="font-bold text-[#587965]">{correct?.text}</span></p>
+                  <div className="mt-4 space-y-2">
+                    {q.options.map(option => {
+                      const isCorrect = option.id === q.correctId
+                      const isWrongSelection = option.id === answer?.selectedId && !answer?.correct
+                      return <div key={option.id} className={`rounded-xl border px-3 py-2.5 text-sm ${isCorrect ? 'border-[#90b49e] bg-[#edf5ef] text-[#466452]' : isWrongSelection ? 'border-[#dfaaa0] bg-[#f9ece8] text-[#835b54]' : 'border-[#e7e9e5] bg-white'}`}>
+                        <span className="mr-2 font-bold">{option.id}.</span>{option.text}
+                      </div>
+                    })}
+                  </div>
+                  <p className="mt-3 text-sm text-[#7b817e]">Your answer: <span className="font-bold">{selectedOption?.text || 'Not answered'}</span></p>
+                  <p className="mt-1 text-sm text-[#587965]">Correct answer: <span className="font-bold">{correctOption?.text}</span></p>
                   <p className="mt-2 text-sm leading-6 text-[#68716d]">{q.explanation}</p>
                 </div>
               )
@@ -729,7 +846,7 @@ function StatsView({ state, allQuestions, accuracy, practiced }: {
   )
 }
 
-function QuestionBankModal({ questions, close, onAdd }: { questions: Question[]; close: () => void; onAdd: (q: Question) => void }) {
+function QuestionBankModal({ questions, close, onAdd }: { questions: Question[]; close: () => void; onAdd: (q: Question | Question[]) => void }) {
   const [tab, setTab] = useState<'json'|'manual'>('manual')
   const [text,setText]=useState('')
   const [subject,setSubject]=useState<Subject>('High Performance Computing')
@@ -759,43 +876,10 @@ function QuestionBankModal({ questions, close, onAdd }: { questions: Question[];
   }
   const parseJson = () => {
     try {
-      let input:any[]
-      if (text.trim().startsWith('[') || text.trim().startsWith('{')) {
-        const data=JSON.parse(text)
-        input=Array.isArray(data)?data:[data]
-      } else {
-        input=[]
-        let current:any=null
-        for (const line of text.split(/\n+/)) {
-          const trimmed=line.trim()
-          const questionMatch=trimmed.match(/^(?:\*\*)?\d+[.)]\s*(.+?)(?:\*\*)?$/)
-          if (questionMatch) {
-            if (current) input.push(current)
-            current={question:questionMatch[1].replace(/^\(\w+\)\s*/,''),answerOptions:[],correctAnswer:undefined,subject}
-            continue
-          }
-          const optionMatch=trimmed.match(/^(?:[-]\s*)?([A-E])[).]\s*(.+)$/)
-          if (optionMatch && current) {
-            current.answerOptions.push(optionMatch[2])
-            if (/✅/.test(trimmed) || /^\*?\s*✅/.test(trimmed)) current.correctAnswer=optionMatch[1]
-            continue
-          }
-          const answerMatch=trimmed.match(/(?:correct answer|answer)\s*[:\-]?\s*([A-E])/i)
-          if (answerMatch && current) current.correctAnswer=answerMatch[1].toUpperCase()
-        }
-        if (current) input.push(current)
-      }
-      input.forEach((item:any,i:number)=>{
-        if(!item.question||!item.answerOptions||item.correctAnswer===undefined) throw new Error('missing')
-        const ids=['A','B','C','D','E']
-        const correctIndex=typeof item.correctAnswer==='number'?item.correctAnswer:ids.indexOf(String(item.correctAnswer).toUpperCase())
-        const opts=item.answerOptions.map((text:string,j:number)=>({id:ids[j],text}))
-        onAdd({
-          id:`custom-${Date.now()}-${i}`,sourceId:`custom-${i}`,subject:item.subject||subject,text:item.question,
-          options:opts,correctId:ids[correctIndex],explanation:item.explanation||'Review the correct option and remember the key concept in this question.'
-        })
-      })
-    } catch { alert('Please use JSON with question, answerOptions, and correctAnswer fields.') }
+      onAdd(parseUploadedQuestions(text, subject))
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'The question file could not be verified and needs manual review.')
+    }
   }
   const addManual = () => {
     if(!text.trim()||options.some(o=>!o.trim())) return

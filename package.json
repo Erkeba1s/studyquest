@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "questions:import": "node scripts/import-question-bank.mjs",
+    "questions:check": "node scripts/import-question-bank.mjs --check"
   },
   "dependencies": {
     "framer-motion": "^12.23.24",
